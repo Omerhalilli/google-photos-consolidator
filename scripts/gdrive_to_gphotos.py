@@ -144,13 +144,14 @@ def _save_token(creds: Credentials, token_path: str) -> None:
 # ---------------------------------------------------------------------------
 class DriveClient:
     def __init__(self, creds: Credentials, read_timeout: int = 900) -> None:
-        # Build with a long read timeout so large videos don't abort mid-download.
+        # Build with a long read timeout so large videos don't abort
+        # mid-download. AuthorizedHttp carries the credentials, so DO NOT
+        # also pass `credentials=` (they're mutually exclusive).
         http = AuthorizedHttp(
             creds,
             http=httplib2.Http(timeout=read_timeout),
         )
-        self.service = build("drive", "v3", credentials=creds, http=http,
-                             cache_discovery=False)
+        self.service = build("drive", "v3", http=http, cache_discovery=False)
         self._read_timeout = read_timeout
 
     def find_root_ids(self, names: List[str]) -> Dict[str, List[str]]:
