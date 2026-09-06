@@ -47,7 +47,24 @@ from googleapiclient.http import MediaIoBaseDownload
 # ---------------------------------------------------------------------------
 # configuration
 # ---------------------------------------------------------------------------
-FOLDER_NAMES = ["2025 fotolari", "2026 fotolari", "Consolidated"]
+# Target folders (exact names, Unicode-aware: "2025 fotoları" uses the
+# Turkish dotless "ı"). Lookup falls back to ASCII-folded spellings, so
+# "2025 fotolari" / "2025 fotoları" both match.
+FOLDER_NAMES = ["2025 fotoları", "2026 fotoları", "Consolidated"]
+
+_ASCII_FOLD = {
+    "ı": "i", "İ": "i", "ş": "s", "Ş": "s", "ç": "c", "Ç": "c",
+    "ğ": "g", "Ğ": "g", "ö": "o", "Ö": "o", "ü": "u", "Ü": "u",
+    "â": "a", "î": "i", "û": "u",
+}
+
+
+def ascii_fold(name: str) -> str:
+    """Lowercase + fold Turkish/accented characters to ASCII (name lookup)."""
+    folded = name.lower()
+    for src, dst in _ASCII_FOLD.items():
+        folded = folded.replace(src, dst)
+    return folded
 MEDIA_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif", ".tif",
     ".tiff", ".ico",
@@ -132,22 +149,29 @@ class DriveClient:
         """Return {folder_name: [file_id,...]} for the top-level targets."""
         out: Dict[str, List[str]] = {}
         for name in names:
-            query = (
-                f"name = '{_esc(name)}' and mimeType = "
-                "'application/vnd.google-apps.folder' and trashed = false"
-            )
-            try:
-                resp = self.service.files().list(
-                    q=query, fields="files(id,name)", pageSize=1000
-                ).execute()
-            except HttpError as exc:
-                log.error("Drive query failed for %r: %s", name, exc)
-                raise
-            ids = [f["id"] for f in resp.get("files", [])]
+            spellings = list(dict.fromkeys([name, ascii_fold(name)]))
+            ids: List[str] = []
+            for spelling in spellings:
+                query = (
+                    f"name = '{_esc(spelling)}' and mimeType = "
+                    "'application/vnd.google-apps.folder' and trashed = false"
+                )
+                try:
+                    resp = self.service.files().list(
+                        q=query, fields="files(id,name)",
+                        pageSize=1000, supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                    ).execute()
+                except HttpError as exc:
+                    log.error("Drive query failed for %r: %s", name, exc)
+                    raise
+                for f in resp.get("files", []):
+                    if f["id"] not in ids:
+                        ids.append(f["id"])
             if not ids:
-                log.warning("No top-level folder named %r found in Drive", name)
+                log.warning("No folder matching %r found in Drive", name)
             else:
-                log.info("Found %d folder(s) named %r", len(ids), name)
+                log.info("Found %d folder(s) for %r", len(ids), name)
             out[name] = ids
         return out
 
@@ -165,7 +189,9 @@ class DriveClient:
                 if page:
                     opts["pageToken"] = page
                 try:
-                    resp = self.service.files().list(**opts).execute()
+                    resp = self.service.files().list(**opts,
+                                                     supportsAllDrives=True,
+                                                     includeItemsFromAllDrives=True).execute()
                 except HttpError as exc:
                     log.error("Drive list failed: %s", exc)
                     raise
