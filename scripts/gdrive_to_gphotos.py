@@ -37,10 +37,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import requests
-import httplib2
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
-from google_auth_httplib2 import AuthorizedHttp
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -143,16 +141,9 @@ def _save_token(creds: Credentials, token_path: str) -> None:
 # Drive access
 # ---------------------------------------------------------------------------
 class DriveClient:
-    def __init__(self, creds: Credentials, read_timeout: int = 900) -> None:
-        # Build with a long read timeout so large videos don't abort
-        # mid-download. AuthorizedHttp carries the credentials, so DO NOT
-        # also pass `credentials=` (they're mutually exclusive).
-        http = AuthorizedHttp(
-            creds,
-            http=httplib2.Http(timeout=read_timeout),
-        )
-        self.service = build("drive", "v3", http=http, cache_discovery=False)
-        self._read_timeout = read_timeout
+    def __init__(self, creds: Credentials) -> None:
+        self.service = build("drive", "v3", credentials=creds,
+                             cache_discovery=False)
 
     def find_root_ids(self, names: List[str]) -> Dict[str, List[str]]:
         """Return {folder_name: [file_id,...]} for the top-level targets."""
@@ -220,30 +211,18 @@ class DriveClient:
         return files
 
     def download(self, file_id: str) -> Tuple[bytes, str, int]:
-        """Return (bytes, mime, size) of a file, retrying on transient errors."""
+        """Return (bytes, mime, size) of a file."""
         meta = self.service.files().get(
             fileId=file_id, fields="mimeType,size").execute()
         size = int(meta.get("size", 0))
         mime = meta.get("mimeType", "application/octet-stream")
-        last_exc: Optional[Exception] = None
-        for attempt in range(4):
-            try:
-                request = self.service.files().get_media(fileId=file_id)
-                buf = _BytesBuffer()
-                dl = MediaIoBaseDownload(buf, request, chunksize=4 * 1024 * 1024)
-                done = False
-                while not done:
-                    try:
-                        _, done = dl.next_chunk()
-                    except Exception:  # noqa: BLE001  (resume not supported; re-download)
-                        raise
-                return buf.getvalue(), mime, size
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                if attempt == 3:
-                    break
-                time.sleep(2 ** attempt)
-        raise RuntimeError(f"download failed after retries: {last_exc}")
+        request = self.service.files().get_media(fileId=file_id)
+        buf = _BytesBuffer()
+        dl = MediaIoBaseDownload(buf, request, chunksize=1024 * 1024)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        return buf.getvalue(), mime, size
 
 
 class _BytesBuffer:
@@ -420,8 +399,6 @@ def main() -> int:
                         help="directory for OAuth token + upload index (default .)")
     parser.add_argument("--limit", type=int, default=0,
                         help="upload at most N files (0 = unlimited)")
-    parser.add_argument("--jobs", type=int, default=4,
-                        help="parallel download/hash/upload workers (default 4)")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -469,15 +446,11 @@ def main() -> int:
         return 0
     log.info("Files to process after dedupe: %d", total)
 
-    # --- process in parallel: download -> hash-check -> token -> batch ---
-    from concurrent.futures import ThreadPoolExecutor
-
+    # --- process: download -> content-hash check -> upload token -> batch ---
     done = 0
     failed = 0
-    # seen_hashes: hashes known to be uploaded (index snapshot + this run),
-    # so concurrent workers skip same-content files already uploaded.
-    seen_hashes = {r.sha256 for r in index.by_drive_id.values()}
-    pending: List[Tuple[str, str, str, bytes, str]] = []  # (fid,name,token,data,sha)
+    # pending holds (drive_id, name, data) already upload-tokenised
+    pending: List[Tuple[str, str, str, bytes]] = []
 
     def flush_batch():
         nonlocal done, pending
@@ -486,19 +459,19 @@ def main() -> int:
         log.info("Creating %d media items in Photos (batch)...", len(pending))
         try:
             created = photos.batch_create(
-                [(tok, name) for _fid, name, tok, _data, _sha in pending])
+                [(tok, name) for _fid, name, tok, _data in pending])
         except Exception as exc:  # noqa: BLE001
             log.error("batchCreate failed for %d items: %s (will retry next run)",
                       len(pending), exc)
             pending = []
             return
         created_here = 0
-        for fid, name, _tok, data, sha in pending:
+        for fid, name, _tok, data in pending:
             pid = created.get(name)
             if pid:
                 rec = UploadRecord(
                     drive_id=fid, name=name, size=len(data),
-                    sha256=sha, gphoto_id=pid,
+                    sha256=sha256_bytes(data), gphoto_id=pid,
                     uploaded_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 )
                 index.add(rec)
@@ -511,37 +484,30 @@ def main() -> int:
         log.info("Progress: %d/%d uploaded, %d failed",
                  done, total, failed)
 
-    def process_one(item):
-        fid, name = item
+    BATCH = 10  # slow & steady; parallel batches hit SSL issues on py3.14
+    for fid, name in candidates:
+        # download
         try:
-            data, _mime, _size = drive.download(fid)
+            data, _mime, size = drive.download(fid)
         except Exception as exc:  # noqa: BLE001
             log.error("download failed %r: %s", name, exc)
-            return None
+            failed += 1
+            continue
+        # content-hash dedupe (skips renamed files already uploaded here)
         h = sha256_bytes(data)
-        if h in seen_hashes:
+        if index.has_hash(h):
             log.info("skip (identical content already uploaded): %s", name)
-            return None
+            continue
+        # upload to Photos (raw bytes -> upload token)
         try:
             token = photos.upload_bytes(data)
         except Exception as exc:  # noqa: BLE001
             log.error("upload failed %r: %s", name, exc)
-            return None
-        return (fid, name, token, data, h)
-
-    BATCH = 50  # Google's batchCreate limit
-    workers = max(1, min(args.jobs, 8))
-    log.info("Using %d parallel workers, batches of %d", workers, BATCH)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for result in pool.map(process_one, candidates):
-            if result is None:
-                failed += 1
-                continue
-            fid, name, token, data, h = result
-            seen_hashes.add(h)
-            pending.append(result)
-            if len(pending) >= BATCH:
-                flush_batch()
+            failed += 1
+            continue
+        pending.append((fid, name, token, data))
+        if len(pending) >= BATCH:
+            flush_batch()
     flush_batch()
 
     log.info("ALL DONE. New uploads this run: %d  (failed: %d)",
