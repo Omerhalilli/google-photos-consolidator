@@ -355,10 +355,54 @@ def _selftest() -> int:
     import unittest
 
     root = os.path.dirname(os.path.abspath(__file__))
-    suite = unittest.defaultTestLoader.discover(
-        os.path.join(root, "tests"), top_level_dir=root)
+    sys.path.insert(0, root)
+    suite = unittest.defaultTestLoader.discover("tests")
     result = unittest.TextTestRunner(verbosity=1).run(suite)
     return 0 if result.wasSuccessful() else 1
+
+
+def _connectivity(kind: str, cfg: dict, only_accounts) -> int:
+    """--verify: build backends, reach every account, dump first items.
+
+    No uploads, no mutations — just proves your credentials are valid and
+    shows what the API actually exposes. Exits 0 on success.
+    """
+    import traceback
+
+    log = Logger(level=cfg["logging"].get("log_level", "INFO"),
+                 log_file=cfg["logging"].get("log_file", ""))
+    try:
+        backends = build_backends(kind, cfg, only_accounts)
+    except (BackendError, SystemExit) as exc:
+        log.error(f"backend init failed: {exc}")
+        return 2
+    ok = True
+    for b in backends:
+        try:
+            b.check_access()
+            caps = b.capabilities()
+            log.info(f"account {b.account_id}: CONNECTED")
+            log.info(f"  free storage: {fmt_bytes(free_storage_bytes(b))}")
+            log.info(f"  capabilities: app_created_only={caps.app_created_only} "
+                     f"api_delete={caps.can_delete_library_items} "
+                     f"originals_visible={caps.originals_visible}")
+            shown = 0
+            for item in b.list_all():
+                if shown < 3:
+                    log.info(f"  sample item type={item.media_type} "
+                             f"url={'yes' if item.product_url else 'none'}")
+                shown += 1
+            log.info(f"  items visible to API: {shown}")
+            if shown == 0:
+                log.warning("  NOTE: the API sees ZERO items. If everything "
+                            "was uploaded via the Photos app/website this is "
+                            "expected (app-created-content-only scopes).")
+        except BackendError as exc:
+            log.error(f"account {b.account_id}: FAILED ({exc})")
+            traceback.print_exc()
+            ok = False
+    log.info("verify " + ("OK" if ok else "FAILED — fix credentials, see README"))
+    return 0 if ok else 1
 
 
 def main() -> int:
@@ -380,6 +424,9 @@ def main() -> int:
                         help="process at most N photos total (0 = unlimited)")
     parser.add_argument("--self-test", action="store_true",
                         help="run the unit tests, then exit")
+    parser.add_argument("--verify", action="store_true",
+                        help="test the connection to every account (no "
+                             "uploads, no changes) then exit")
     parser.add_argument("--log-level", default=None)
     args = parser.parse_args()
 
@@ -398,6 +445,9 @@ def main() -> int:
     elif os.environ.get("GPC_ACCOUNTS"):
         only_accounts = [int(x) for x in
                          os.environ["GPC_ACCOUNTS"].split(",") if x.strip()]
+
+    if args.verify:
+        return _connectivity(kind, cfg, only_accounts)
 
     log = Logger(
         level=cfg["logging"].get("log_level", "INFO"),

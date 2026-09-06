@@ -50,35 +50,110 @@ API ([official update](https://developers.google.com/photos/support/updates)):
   library access is Google's [Photos Partner Program](https://developers.google.com/photos/overview/partners)
   (a business application process).
 
-## Install
+## Install (step by step, for a normal person)
 
+### 1. Get the files
+Download this repository (green **Code ▾ → Download ZIP**) and unzip it, or:
+```bash
+git clone https://github.com/Omerhalilli/google-photos-consolidator.git
+cd google-photos-consolidator
+```
+
+### 2. Install Python 3.9+ if you don't have it
+- **Windows**: install from [python.org](https://www.python.org/downloads/). 
+  ⚠️ **Check "Add Python to PATH" during install** — if you don't, `python` will not work in your terminal.
+- **macOS / Linux**: usually already installed. Check with `python3 --version`.
+
+### 3. Create a virtual environment and install dependencies
+Run these commands *inside the `google-photos-consolidator` folder*.
+
+**Linux / macOS:**
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-## Configure (OAuth backend)
-
-1. Create an OAuth client in [Google Cloud Console](https://console.cloud.google.com)
-   (Desktop app type), enable **Photos Library API** + **Drive API**, and
-   download `client_secret.json`. Never commit it.
-2. Edit `config.yaml`:
-   - one `accounts` entry per Google account (numeric `id`, token filename)
-   - keep the current 2026 scopes listed under `oauth.photos_scopes`
-3. Point the tool at your secret and a token dir (tokens are stored locally,
-   gitignored):
-
-```bash
-export GPC_OAUTH_CLIENT_SECRET=/path/to/client_secret.json
-export GPC_OAUTH_TOKEN_DIR=/path/to/local/token/dir
+**Windows (Command Prompt / PowerShell):**
+```bat
+py -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
 ```
+> If `py` is missing, try `python -m venv .venv` and `.venv\Scripts\pip install -r requirements.txt`.
+
+### 4. Verify everything installed correctly (no credentials needed)
+```bash
+# Linux / macOS:
+.venv/bin/python main.py --self-test
+
+# Windows:
+.venv\Scripts\python main.py --self-test
+```
+You should see `OK` with **14 tests passing**. If that works, the code is sound and the only remaining step is giving it real Google credentials.
+
+## Configure (OAuth backend) — the long version
+
+This is the only part that needs a bit of setup. It's a one-time cost per Google account.
+
+### A. Create a Google Cloud project
+1. Go to [console.cloud.google.com](https://console.cloud.google.com).
+2. Click the project dropdown top-left → **New Project** → name it (e.g. `photos-consolidator`) → **Create**.
+
+### B. Enable the two required APIs
+1. **APIs & Services → Library**.
+2. Search and **Enable** both:
+   - **Photos Library API**
+   - **Google Drive API**
+   (Free space is read from Drive because Google Photos shares the same storage pool — no extra cost.)
+
+### C. Create the OAuth client (one per Google account)
+This step must be repeated for **each** account you want to consolidate.
+1. **APIs & Services → Credentials → Create Credentials → OAuth client ID.**
+2. If asked, configure the **OAuth consent screen** first:
+   - External, app name `photos-consolidator`, your email. (Still in "Testing" mode is fine for your own accounts.)
+3. Application type: **Desktop app** → name it → **Create**.
+4. Click **Download JSON** → this is your `client_secret.json`. Save it somewhere safe. **Never commit it to a repo.**
+5. While in the consent screen, add your Gmail address(es) to **Test users** so the browser authorization is allowed.
+
+### D. Tell the tool about the credentials
+Set two environment variables (per shell session):
+```bash
+# Linux / macOS:
+export GPC_OAUTH_CLIENT_SECRET=/full/path/to/client_secret.json
+export GPC_OAUTH_TOKEN_DIR=/full/path/where/tokens/are/saved
+
+# Windows (PowerShell):
+$env:GPC_OAUTH_CLIENT_SECRET="C:\path\to\client_secret.json"
+$env:GPC_OAUTH_TOKEN_DIR="C:\path\to\token\folder"
+```
+`GPC_OAUTH_TOKEN_DIR` can be any empty folder — the tool stores your login tokens there locally and never uploads them.
+
+### E. Put your accounts in config.yaml
+Open `config.yaml` and make sure you have one entry per account with a unique `id`:
+```yaml
+accounts:
+  - id: 1
+    oauth_token: account_1.json
+  - id: 2
+    oauth_token: account_2.json
+```
+The token filename can be anything; it just needs to differ per account.
+
+### F. Verify the connection (this is the "did it actually work?" test)
+```bash
+.venv/bin/python main.py --verify --log-level DEBUG
+```
+The first time, a browser tab opens and asks you to **log in and click Allow** for each account in turn. Afterwards:
+- `account 1: CONNECTED`  and
+- `account 2: CONNECTED`
+means your credentials are valid. If an account prints `FAILED`, follow the troubleshooting table below.
+
+> `--verify` only *lists* what the API can see — it uploads and changes nothing.
 
 ## Configure (rclone backend)
 
 ```bash
 rclone config          # create one "google photos" remote per account
 ```
-
 Use rclone's current scopes when creating your own client id:
 `photoslibrary.appendonly`,
 `photoslibrary.readonly.appcreateddata`,
@@ -86,6 +161,10 @@ Use rclone's current scopes when creating your own client id:
 
 Set each account's `rclone_remote` (and a Drive remote in `storage_rclone`
 so free space can be read — `rclone about` is unsupported on photos remotes).
+Then verify with:
+```bash
+.venv/bin/python main.py --backend rclone --verify
+```
 
 ## Run
 
@@ -96,6 +175,27 @@ so free space can be read — `rclone about` is unsupported on photos remotes).
 # Real run: uploads verified copies, writes the removal manifest:
 .venv/bin/python main.py
 ```
+
+## Troubleshooting (when something "doesn't work")
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `python: command not found` / `py: command not found` | Python not on PATH | Reinstall Python and tick **"Add Python to PATH"**; reopen the terminal. |
+| `env 'GPC_OAUTH_CLIENT_SECRET' not set` | env var not exported in this shell | Run the `export`/`$env:` lines again in the SAME terminal window before `main.py`. |
+| `Permission denied` on download / token dir | token dir unwritable | `GPC_OAUCT_TOKEN_DIR` must point to a folder you can write to; create it first (`mkdir -p`). |
+| Browser opens but says **"This app is blocked"** / no Allow button | OAuth consent screen not finished | Go to consent screen → **Publishing status: Testing** → add your email under **Test users**. |
+| `--verify` prints `FAILED` with HTTP 403 / "access not configured" | Photos Library API not enabled for that project | APIs & Services → Library → enable **Photos Library API** (and Drive API) for the *same* project. |
+| `--verify` prints `account N: FAILED` with a refresh-token error | Token expired / revoked | Delete the token file in `GPC_OAUTH_TOKEN_DIR` for that account and run `--verify` again to re-authorize. |
+| `config not found: config.yaml` | You ran it from the wrong folder | `cd` into the `google-photos-consolidator` folder first (the `--config` flag / `GPC_CONFIG` env overrides the path). |
+| API sees **0 items** | You uploaded photos via the Photos app/website; the 2026 API only exposes app-created content | This is expected and unavoidable (see "What Google actually allows"). The tool still uploads & dedupes everything the API exposes. |
+| `No module named google.auth` or `ImportError` | Dependencies not installed | Rerun the `pip install -r requirements.txt` step in step 3. |
+| Process hangs on `run_local_server` / port | OAuth needs a browser on the same machine as the tool | Run on your local machine (not a headless server/SSH-only box) for the one-time authorization. |
+
+If your symptom isn't listed, run:
+```bash
+.venv/bin/python main.py --verify --log-level DEBUG
+```
+and send the top of the output (it is redacted — no emails, tokens or filenames).
 
 ### What happens at the end
 
@@ -124,6 +224,7 @@ click the links, and delete the source copies in the Photos web UI.
 | `--jobs N` | hash-worker parallelism (env `GPC_JOBS` also works; default `concurrency` in config) |
 | `--limit N` | process at most N distinct hashes (dry-run safety net) |
 | `--self-test` | run unit tests, then exit (no credentials required) |
+| `--verify` | test the connection to every account (no uploads, no changes) |
 | `--log-level` | DEBUG / INFO / WARNING / ERROR |
 
 ## Safety & privacy
