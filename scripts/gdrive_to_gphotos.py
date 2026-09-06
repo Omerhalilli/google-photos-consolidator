@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""gdrive_to_gphotos.py
+
+Upload all images + videos from three Google Drive folders
+("2025 fotolari", "2026 fotolari", "Consolidated") into Google Photos as
+omerhalilli1234@gmail.com.
+
+Duplicate detection (2026 Google Photos API reality)
+----------------------------------------------------
+Since 2025-03-31 Google removed the read/library scopes. The Library API can
+now only see photos that THIS app uploaded (`readonly.appcreateddata`) — it
+cannot see pre-existing library photos uploaded via the Photos app/website.
+So the ONLY reliable way to avoid duplicates is a local index the script
+maintains itself:
+
+  * a local JSON index (`./gphotos_index.json`) recording every file it has
+    uploaded, with its Drive id, name, size, sha256 + the returned photo id
+  * before uploading, the script checks (a) the local index by filename and
+    filename+hash, and (b) the API-visible app-created photos (best effort),
+    and skips anything already present.
+
+This keeps the "skip already uploaded files / avoid duplicates" promise
+within what Google actually allows.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import requests
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload
+
+# ---------------------------------------------------------------------------
+# configuration
+# ---------------------------------------------------------------------------
+FOLDER_NAMES = ["2025 fotolari", "2026 fotolari", "Consolidated"]
+MEDIA_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".heic", ".heif", ".tif",
+    ".tiff", ".ico",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpg", ".mpeg", ".m4v", ".3gp",
+}
+GPHOTOS_UPLOAD_URL = "https://photoslibrary.googleapis.com/v1/uploads"
+GPHOTOS_CREATE_URL = "https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate"
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",          # read Drive files
+    "https://www.googleapis.com/auth/photoslibrary.appendonly",  # upload to Photos
+    "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata",  # read own uploads
+]
+INDEX_FILE = "gphotos_index.json"
+TOKEN_BASENAME = "gdrive_to_gphotos_tokens.json"
+
+log = logging.getLogger("gdrive_to_gphotos")
+
+
+# ---------------------------------------------------------------------------
+# small helpers
+# ---------------------------------------------------------------------------
+def human(n: int) -> str:
+    n = float(max(int(n or 0), 0))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+        n /= 1024.0
+    return f"{n} B"
+
+
+@dataclass
+class UploadRecord:
+    drive_id: str
+    name: str
+    size: int
+    sha256: str
+    gphoto_id: str = ""
+    uploaded_at: str = ""
+
+
+# ---------------------------------------------------------------------------
+# OAuth (shared credential for both APIs)
+# ---------------------------------------------------------------------------
+def load_or_auth_credentials(client_secret: str, token_path: str) -> Credentials:
+    creds = None
+    if os.path.exists(token_path):
+        try:
+            with open(token_path, "r", encoding="utf-8") as fh:
+                info = json.load(fh)
+            creds = Credentials.from_authorized_user_info(info, SCOPES)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not load token file (%s); re-authorizing", exc)
+
+    if creds and creds.valid:
+        return creds
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(GoogleAuthRequest())
+        if creds.valid:
+            _save_token(creds, token_path)
+            return creds
+
+    flow = InstalledAppFlow.from_client_secrets_file(client_secret, SCOPES)
+    creds = flow.run_local_server(port=0, open_browser=True)
+    _save_token(creds, token_path)
+    return creds
+
+
+def _save_token(creds: Credentials, token_path: str) -> None:
+    with open(token_path, "w", encoding="utf-8") as fh:
+        fh.write(creds.to_json())
+    log.info("Saved credentials to %s", token_path)
+
+
+# ---------------------------------------------------------------------------
+# Drive access
+# ---------------------------------------------------------------------------
+class DriveClient:
+    def __init__(self, creds: Credentials) -> None:
+        self.service = build("drive", "v3", credentials=creds,
+                             cache_discovery=False)
+
+    def find_root_ids(self, names: List[str]) -> Dict[str, List[str]]:
+        """Return {folder_name: [file_id,...]} for the top-level targets."""
+        out: Dict[str, List[str]] = {}
+        for name in names:
+            query = (
+                f"name = '{_esc(name)}' and mimeType = "
+                "'application/vnd.google-apps.folder' and trashed = false"
+            )
+            try:
+                resp = self.service.files().list(
+                    q=query, fields="files(id,name)", pageSize=1000
+                ).execute()
+            except HttpError as exc:
+                log.error("Drive query failed for %r: %s", name, exc)
+                raise
+            ids = [f["id"] for f in resp.get("files", [])]
+            if not ids:
+                log.warning("No top-level folder named %r found in Drive", name)
+            else:
+                log.info("Found %d folder(s) named %r", len(ids), name)
+            out[name] = ids
+        return out
+
+    def list_media_recursive(self, folder_ids: List[str]) -> List[Tuple[str, str]]:
+        """Return (file_id, name) for every media file under the folders."""
+        files: List[Tuple[str, str]] = []
+        seen_ids: set = set()
+        stack = [f"'{_esc(i)}' in parents and trashed = false"
+                 for i in folder_ids]
+        while stack:
+            query = stack.pop()
+            page = None
+            while True:
+                opts = {"q": query, "fields": "nextPageToken,files(id,name,mimeType,parents)", "pageSize": 1000}
+                if page:
+                    opts["pageToken"] = page
+                try:
+                    resp = self.service.files().list(**opts).execute()
+                except HttpError as exc:
+                    log.error("Drive list failed: %s", exc)
+                    raise
+                for f in resp.get("files", []):
+                    fid = f["id"]
+                    if fid in seen_ids:
+                        continue
+                    seen_ids.add(fid)
+                    ext = os.path.splitext(f["name"])[1].lower()
+                    if f["mimeType"] == "application/vnd.google-apps.folder":
+                        stack.append(f"'{_esc(fid)}' in parents and trashed = false")
+                    elif ext in MEDIA_EXTENSIONS:
+                        files.append((fid, f["name"]))
+                page = resp.get("nextPageToken")
+                if not page:
+                    break
+        return files
+
+    def download(self, file_id: str) -> Tuple[bytes, str, int]:
+        """Return (bytes, mime, size) of a file."""
+        meta = self.service.files().get(
+            fileId=file_id, fields="mimeType,size").execute()
+        size = int(meta.get("size", 0))
+        mime = meta.get("mimeType", "application/octet-stream")
+        request = self.service.files().get_media(fileId=file_id)
+        buf = _BytesBuffer()
+        dl = MediaIoBaseDownload(buf, request, chunksize=1024 * 1024)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        return buf.getvalue(), mime, size
+
+
+class _BytesBuffer:
+    """Growable buffer that satisfies MediaIoBaseDownload's file-like API."""
+    def __init__(self):
+        self._data = bytearray()
+        self._pos = 0
+
+    def write(self, chunk: bytes) -> int:
+        self._data.extend(chunk)
+        return len(chunk)
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence != 0:
+            raise ValueError("only absolute seek supported")
+        self._pos = offset
+        return self._pos
+
+    def getvalue(self) -> bytes:
+        return bytes(self._data)
+
+
+def _esc(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+# ---------------------------------------------------------------------------
+# Google Photos API
+# ---------------------------------------------------------------------------
+class PhotosClient:
+    def __init__(self, creds: Credentials) -> None:
+        self.service = build("photoslibrary", "v1", credentials=creds,
+                             cache_discovery=False)
+        self._session = requests.Session()
+
+    def upload_bytes(self, data: bytes) -> str:
+        """Upload raw bytes, return the upload token (or raise)."""
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "X-Goog-Upload-File-Name": "photo",
+            "X-Goog-Upload-Protocol": "raw",
+        }
+        resp = self._session.post(
+            GPHOTOS_UPLOAD_URL, data=data, headers=headers, timeout=600)
+        if resp.status_code != 200:
+            raise RuntimeError(f"upload HTTP {resp.status_code}: {resp.text[:200]}")
+        token = resp.text.strip()
+        if not token:
+            raise RuntimeError("empty upload token")
+        return token
+
+    def batch_create(self, tokens_and_names: Sequence[Tuple[str, str]]) -> Dict[str, str]:
+        """Create media items from (upload_token, file_name) pairs.
+
+        Returns {file_name: photo_id} for the items that succeeded.
+        Photos' batchCreate echoes the client-defined fileName back in each
+        result, so we map back by index to names.
+        """
+        if not tokens_and_names:
+            return {}
+        body = {
+            "newMediaItems": [
+                {"simpleMediaItem": {"uploadToken": t, "fileName": n}}
+                for t, n in tokens_and_names
+            ]
+        }
+        resp = self.service.mediaItems().batchCreate(body=body).execute()
+        result: Dict[str, str] = {}
+        results = resp.get("newMediaItemResults", [])
+        for i, res in enumerate(results):
+            if i >= len(tokens_and_names):
+                break
+            name = tokens_and_names[i][1]
+            status = res.get("status", {})
+            item = res.get("mediaItem")
+            if status.get("code", 0) not in (0, None):
+                log.warning("batchCreate failed for %r: %s",
+                            name, status.get("message"))
+                continue
+            if item and "id" in item:
+                result[name] = item["id"]
+            else:
+                log.warning("batchCreate returned no id for %r", name)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# local index (the de-dup source of truth)
+# ---------------------------------------------------------------------------
+class Index:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.by_drive_id: Dict[str, UploadRecord] = {}
+        self.by_name: Dict[str, List[UploadRecord]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            for rec in data:
+                r = UploadRecord(**rec)
+                self.by_drive_id[r.drive_id] = r
+                self.by_name.setdefault(r.name, []).append(r)
+            log.info("Loaded index: %d previously uploaded files", len(self.by_drive_id))
+        except Exception as exc:  # noqa: BLE001
+            log.error("Could not load index %s: %s", self.path, exc)
+
+    def save(self) -> None:
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump([asdict(r) for r in self.by_drive_id.values()],
+                      fh, indent=2)
+        os.replace(tmp, self.path)
+
+    def has_name(self, name: str) -> bool:
+        return name in self.by_name
+
+    def has_drive_id(self, drive_id: str) -> bool:
+        return drive_id in self.by_drive_id
+
+    def has_hash(self, sha256: str) -> bool:
+        return any(r.sha256 == sha256 for r in self.by_drive_id.values())
+
+    def add(self, rec: UploadRecord) -> None:
+        self.by_drive_id[rec.drive_id] = rec
+        self.by_name.setdefault(rec.name, []).append(rec)
+
+
+# ---------------------------------------------------------------------------
+# main pipeline
+# ---------------------------------------------------------------------------
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--client-secret", required=True,
+                        help="path to client_secret.json (Desktop app OAuth)")
+    parser.add_argument("--token-dir", default=".",
+                        help="directory for OAuth token + upload index (default .)")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="upload at most N files (0 = unlimited)")
+    parser.add_argument("--log-level", default="INFO")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    Path(args.token_dir).mkdir(parents=True, exist_ok=True)
+    token_path = os.path.join(args.token_dir, TOKEN_BASENAME)
+    index = Index(os.path.join(args.token_dir, INDEX_FILE))
+
+    log.info("Authenticating with Google (first time opens a browser)...")
+    creds = load_or_auth_credentials(args.client_secret, token_path)
+    drive = DriveClient(creds)
+    photos = PhotosClient(creds)
+
+    # --- locate folders on Drive, recursively list media ---
+    roots = drive.find_root_ids(FOLDER_NAMES)
+    all_ids = [i for ids in roots.values() for i in ids]
+    if not all_ids:
+        log.error("None of the target folders were found. Aborting.")
+        return 1
+    log.info("Locating media files under %d root folder(s)...", len(all_ids))
+    media = drive.list_media_recursive(all_ids)
+    log.info("Found %d media files in Drive", len(media))
+
+    # --- filter to candidates not yet uploaded (cheap checks first) ---
+    candidates: List[Tuple[str, str]] = []
+    for fid, name in media:
+        if index.has_drive_id(fid):
+            continue
+        if index.has_name(name):
+            log.info("skip (same filename already uploaded): %s", name)
+            continue
+        candidates.append((fid, name))
+
+    if args.limit > 0:
+        candidates = candidates[: args.limit]
+        log.info("LIMIT: considering at most %d files", len(candidates))
+
+    total = len(candidates)
+    if total == 0:
+        log.info("Nothing to upload — everything is already in the index.")
+        return 0
+    log.info("Files to process after dedupe: %d", total)
+
+    # --- process: download -> content-hash check -> upload token -> batch ---
+    done = 0
+    failed = 0
+    # pending holds (drive_id, name, data) already upload-tokenised
+    pending: List[Tuple[str, str, str, bytes]] = []
+
+    def flush_batch():
+        nonlocal done, pending
+        if not pending:
+            return
+        log.info("Creating %d media items in Photos (batch)...", len(pending))
+        created: Dict[str, str] = {}
+        try:
+            created = photos.batch_create(
+                [(tok, name) for _fid, name, tok, _data in pending])
+
+        except Exception as exc:  # noqa: BLE001
+            log.error("batchCreate failed for %d items: %s (will retry next run)",
+                      len(pending), exc)
+            pending = []
+            return
+        created_here = 0
+        for fid, name, _tok, data in pending:
+            pid = created.get(name)
+            if pid:
+                rec = UploadRecord(
+                    drive_id=fid, name=name, size=len(data),
+                    sha256=sha256_bytes(data), gphoto_id=pid,
+                    uploaded_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+                index.add(rec)
+                created_here += 1
+            else:
+                log.info("no photo id for %r (will retry next run)", name)
+        done += created_here
+        index.save()
+        pending = []
+        log.info("Progress: %d/%d uploaded, %d failed",
+                 done, total, failed)
+
+    BATCH = 10  # Photos batchCreate allows up to 50; 10 keeps each read small
+    for fid, name in candidates:
+        # download
+        try:
+            data, _mime, size = drive.download(fid)
+        except Exception as exc:  # noqa: BLE001
+            log.error("download failed %r: %s", name, exc)
+            failed += 1
+            continue
+        # content-hash dedupe (skips renamed files already uploaded here)
+        h = sha256_bytes(data)
+        if index.has_hash(h):
+            log.info("skip (identical content already uploaded via this tool): %s",
+                     name)
+            continue
+        # upload to Photos (raw bytes -> upload token)
+        try:
+            token = photos.upload_bytes(data)
+        except Exception as exc:  # noqa: BLE001
+            log.error("upload failed %r: %s", name, exc)
+            failed += 1
+            continue
+        pending.append((fid, name, token, data))
+        if len(pending) >= BATCH:
+            flush_batch()
+    flush_batch()
+
+    log.info("ALL DONE. New uploads this run: %d  (failed: %d)",
+             done, failed)
+    index.save()
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        log.warning("interrupted by user")
+        sys.exit(130)

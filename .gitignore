@@ -9,3 +9,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# drive -> photos script state (secrets + upload index)
+scripts/*_tokens.json
+scripts/gphotos_index.json
