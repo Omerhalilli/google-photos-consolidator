@@ -42,6 +42,7 @@ from backend.base import (
 )
 
 UPLOAD_URL = "https://photoslibrary.googleapis.com/v1/uploads"
+PHOTOS_BASE = "https://photoslibrary.googleapis.com/v1"
 CREATE_URL = "https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate"
 ALBUM_REMOVE_URL = (
     "https://photoslibrary.googleapis.com/v1/albums/{album_id}:batchRemoveMediaItems"
@@ -72,6 +73,59 @@ class _StreamReader(io.RawIOBase):
     def close(self) -> None:
         self._resp.close()
         super().close()
+
+
+class _Executable:
+    """Lazy REST call that mirrors googleapiclient's `.execute()` shape."""
+
+    def __init__(self, client, method: str, path: str,
+                 params=None, body=None) -> None:
+        self._client = client
+        self._method = method
+        self._path = path
+        self._params = params or {}
+        self._body = body
+
+    def execute(self):
+        return self._client._request(
+            self._method, self._path, params=self._params, body=self._body)
+
+
+class _ResourceChild:
+    """mediaItems(...) / albums(...) builder (mediaItems().list(**p).execute())."""
+
+    def __init__(self, client, base_path: str) -> None:
+        self._client = client
+        self._base = base_path
+
+    def list(self, **params) -> _Executable:
+        return _Executable(self._client, "GET", self._base, params=params)
+
+    def get(self, mediaItemId: str) -> _Executable:
+        from urllib.parse import quote
+        return _Executable(self._client, "GET", f"{self._base}/{quote(mediaItemId)}")
+
+    def create(self, body=None) -> _Executable:
+        return _Executable(self._client, "POST", self._base, body=body)
+
+    def batchCreate(self, body=None) -> _Executable:
+        return _Executable(self._client, "POST", f"{self._base}:batchCreate",
+                           body=body)
+
+
+class _ServiceProxy:
+    """Minimal discovery-shaped facade backed by plain REST calls.
+
+    googleapiclient's `build("photoslibrary", "v1")` fails since Google no
+    longer serves a public discovery document for the Photos Library API, so
+    every service call is instead executed as a direct REST request with the
+    OAuth token (same endpoints, same semantics).
+    """
+
+    def __init__(self, client) -> None:
+        self._client = client
+        self.mediaItems = lambda: _ResourceChild(client, "/mediaItems")
+        self.albums = lambda: _ResourceChild(client, "/albums")
 
 
 class GooglePhotosOAuthBackend(BaseBackend):
@@ -151,12 +205,42 @@ class GooglePhotosOAuthBackend(BaseBackend):
     @property
     def service(self):
         if self._service is None:
-            creds = self._load_or_authorize()
-            self._service = build(
-                "photoslibrary", "v1", credentials=creds,
-                cache_discovery=False,
-            )
+            self._load_or_authorize()
+            self._service = _ServiceProxy(self)
         return self._service
+
+    # -- plain REST accessor (no googleapiclient discovery for Photos) -----
+    def _request(self, method: str, path: str, params=None, body=None):
+        """Requests-backed REST call with auth + transient-error retries."""
+        if self._creds is None or self._creds.expired:
+            self._load_or_authorize()
+        url = PHOTOS_BASE + path
+        headers = {"Authorization": "Bearer " + self._creds.token}
+        if params:
+            params = {k: v for k, v in params.items() if k != "fields"}
+        last: Optional[Exception] = None
+        for attempt in range(self._retries):
+            try:
+                if method == "GET":
+                    resp = requests.get(url, params=params, headers=headers,
+                                        timeout=300)
+                else:
+                    resp = requests.post(url, json=body or {}, headers=headers,
+                                         timeout=300)
+            except (requests.RequestException, OSError) as exc:
+                last = exc
+                time.sleep(self._backoff ** attempt)
+                continue
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last = BackendError(f"[{path}] HTTP {resp.status_code}")
+                time.sleep(self._backoff ** attempt)
+                continue
+            if resp.status_code != 200:
+                raise BackendError(
+                    f"[{path}] HTTP {resp.status_code}: "
+                    f"{resp.text[:200]}")
+            return resp.json()
+        raise BackendError(f"[{path}] transient error persists ({last})")
 
     @property
     def drive_service(self):
@@ -316,7 +400,10 @@ class GooglePhotosOAuthBackend(BaseBackend):
         failure; `create_from_stream` closes it once.
         """
         spool.seek(0)
+        if self._creds is None or self._creds.expired:
+            self._load_or_authorize()
         headers = {
+            "Authorization": "Bearer " + self._creds.token,
             "Content-Type": "application/octet-stream",
             "X-Goog-Upload-File-Name": "photo",
             "X-Goog-Upload-Protocol": "raw",

@@ -53,7 +53,6 @@ MEDIA_EXTENSIONS = {
     ".tiff", ".ico",
     ".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpg", ".mpeg", ".m4v", ".3gp",
 }
-GPHOTOS_UPLOAD_URL = "https://photoslibrary.googleapis.com/v1/uploads"
 GPHOTOS_CREATE_URL = "https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate"
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",          # read Drive files
@@ -228,25 +227,52 @@ def _esc(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Google Photos API
+# Google Photos API (direct REST — Google no longer serves a public
+# discovery document for photoslibrary, so googleapiclient build() fails)
 # ---------------------------------------------------------------------------
 class PhotosClient:
+    BASE = "https://photoslibrary.googleapis.com/v1"
+
     def __init__(self, creds: Credentials) -> None:
-        self.service = build("photoslibrary", "v1", credentials=creds,
-                             cache_discovery=False)
+        self._creds = creds
         self._session = requests.Session()
+
+    def _auth_headers(self) -> dict:
+        if self._creds.expired:
+            self._creds.refresh(GoogleAuthRequest())
+        return {"Authorization": "Bearer " + self._creds.token}
+
+    def _request(self, method: str, path: str, params=None, body=None):
+        url = self.BASE + path
+        headers = self._auth_headers()
+        try:
+            if method == "GET":
+                resp = self._session.get(url, params=params, headers=headers,
+                                         timeout=600)
+            else:
+                resp = self._session.post(url, json=body, headers=headers,
+                                          timeout=600)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Photos {method} {path}: {exc}") from exc
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Photos {method} {path}: HTTP {resp.status_code} "
+                f"{resp.text[:200]}")
+        return resp.json()
 
     def upload_bytes(self, data: bytes) -> str:
         """Upload raw bytes, return the upload token (or raise)."""
-        headers = {
+        headers = self._auth_headers()
+        headers.update({
             "Content-Type": "application/octet-stream",
             "X-Goog-Upload-File-Name": "photo",
             "X-Goog-Upload-Protocol": "raw",
-        }
-        resp = self._session.post(
-            GPHOTOS_UPLOAD_URL, data=data, headers=headers, timeout=600)
+        })
+        resp = self._session.post(self.BASE + "/uploads", data=data,
+                                  headers=headers, timeout=600)
         if resp.status_code != 200:
-            raise RuntimeError(f"upload HTTP {resp.status_code}: {resp.text[:200]}")
+            raise RuntimeError(f"upload HTTP {resp.status_code}: "
+                               f"{resp.text[:200]}")
         token = resp.text.strip()
         if not token:
             raise RuntimeError("empty upload token")
@@ -256,8 +282,6 @@ class PhotosClient:
         """Create media items from (upload_token, file_name) pairs.
 
         Returns {file_name: photo_id} for the items that succeeded.
-        Photos' batchCreate echoes the client-defined fileName back in each
-        result, so we map back by index to names.
         """
         if not tokens_and_names:
             return {}
@@ -267,10 +291,9 @@ class PhotosClient:
                 for t, n in tokens_and_names
             ]
         }
-        resp = self.service.mediaItems().batchCreate(body=body).execute()
+        data = self._request("POST", "/mediaItems:batchCreate", body=body)
         result: Dict[str, str] = {}
-        results = resp.get("newMediaItemResults", [])
-        for i, res in enumerate(results):
+        for i, res in enumerate(data.get("newMediaItemResults", [])):
             if i >= len(tokens_and_names):
                 break
             name = tokens_and_names[i][1]
