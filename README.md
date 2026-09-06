@@ -97,8 +97,21 @@ so free space can be read — `rclone about` is unsupported on photos remotes).
 .venv/bin/python main.py
 ```
 
-Then open `removal_manifest.jsonl`, click the links, and delete the source
-copies in the Photos web UI.
+### What happens at the end
+
+```
+[summary] photos_hashed=1200
+[summary] duplicate_groups=340
+[summary] unique_groups=860
+[summary] bytes_to_target=1.8 GB        # what must fit in the target
+[summary] bytes_freeable_from_sources=4.5 GB
+[summary] queued_or_would_queue_removal=860
+[summary] errors=0
+```
+
+If the plan exceeds the target's free space the tool **aborts before
+anything is moved** (dry-run just warns). Open `removal_manifest.jsonl`,
+click the links, and delete the source copies in the Photos web UI.
 
 ### Flags
 
@@ -107,7 +120,10 @@ copies in the Photos web UI.
 | `--dry-run` | plan only, no mutations |
 | `--backend` | override backend (`oauth`\|`rclone`); env `GPC_BACKEND` |
 | `--accounts` | comma-separated account ids to process; env `GPC_ACCOUNTS` |
-| `--config` | config file path (default `config.yaml`) |
+| `--config` | config file path (env `GPC_CONFIG` also works; default `config.yaml`) |
+| `--jobs N` | hash-worker parallelism (env `GPC_JOBS` also works; default `concurrency` in config) |
+| `--limit N` | process at most N distinct hashes (dry-run safety net) |
+| `--self-test` | run unit tests, then exit (no credentials required) |
 | `--log-level` | DEBUG / INFO / WARNING / ERROR |
 
 ## Safety & privacy

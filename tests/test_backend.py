@@ -53,7 +53,9 @@ class FakeBackend(BaseBackend):
 
     def get_hash(self, item):
         import io
-        return sha256_stream(io.BytesIO(self.items.get(item.media_id, b"")))
+        data = self.items.get(item.media_id, b"")
+        item.size = len(data)
+        return sha256_stream(io.BytesIO(data))
 
     def create_from_stream(self, stream, file_name):
         data = b""
@@ -217,6 +219,47 @@ class TestConsolidation(unittest.TestCase):
             finally:
                 __import__("main").safe_upload = original
             self.assertEqual(len(acct1.items), count_before)
+
+    def test_plan_stats(self):
+        """plan_stats reports bytes to move + bytes freeable per scenario."""
+        from main import plan_stats, fmt_bytes
+
+        def mk(acct, bid, data, size=None):
+            it = MediaItem(acct, bid, bid)
+            it.size = size if size is not None else len(data)
+            return (acct, it)
+
+        dup = b"dup bytes"
+        us = b"unique in source"
+        groups = {
+            # unique source photo (must move)
+            "u-source": [mk(2, "us.jpg", us)],
+            # duplicate where target already has a copy (no move needed)
+            "dup1": [mk(1, "d1a.jpg", dup), mk(2, "d1b.jpg", dup)],
+            # duplicate with no target copy (must move one)
+            "dup2": [mk(2, "d2a.jpg", dup), mk(2, "d2b.jpg", dup)],
+            # duplicate where target has a copy (no move needed)
+            "dup3": [mk(2, "d3a.jpg", dup), mk(1, "d3b.jpg", dup)],
+        }
+        move, freeable = plan_stats(groups, target_idx=1)
+        # move = unique source + dup2 (no target copy)
+        self.assertEqual(move, len(us) + len(dup))
+        # freeable = us + dup1 non-target + dup2 both + dup3 non-target
+        self.assertEqual(freeable,
+                         len(us) + len(dup) + 2 * len(dup) + len(dup))
+        self.assertIn("B", fmt_bytes(123))
+
+    def test_preflight_aborts_when_no_space(self):
+        from main import preflight_move
+        from utils.logger import Logger as _L
+        log = _L("WARNING", "")
+        tgt = FakeBackend(1, free=10)
+        src = FakeBackend(2, free=10)
+        groups = {"u": [(2, MediaItem(2, "f.jpg", "f.jpg", size=100))]}
+        self.assertEqual(preflight_move([src, tgt], groups, 1, log, False), 2)
+        self.assertEqual(preflight_move([src, tgt], groups, 1, log, True), 0)
+        tgt.free = 1000
+        self.assertEqual(preflight_move([src, tgt], groups, 1, log, False), 0)
 
 
 class _tempdir:

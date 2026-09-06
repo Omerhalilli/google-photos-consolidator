@@ -282,46 +282,63 @@ class GooglePhotosOAuthBackend(BaseBackend):
         return _StreamReader(resp)
 
     def get_hash(self, item: MediaItem) -> str:
-        from utils.hashing import sha256_stream
+        from utils.hashing import sha256_stream_size
 
         reader = self.get_bytes(item)
         try:
-            return sha256_stream(reader)
+            digest, size = sha256_stream_size(reader)
+            item.size = size
+            return digest
         finally:
             reader.close()
 
-    def upload_bytes(self, data) -> str:
-        """POST raw bytes to the uploads endpoint, return uploadToken."""
+    def _spool(self, data) -> "object":
+        """Copy a stream/bytes into a seekable spool (memory, spill to disk).
 
-        # Spool keeps memory bounded (and is deleted automatically on close).
-        with tempfile.SpooledTemporaryFile(max_size=_SPOOL_LIMIT, mode="w+b") as spool:
-            with data if hasattr(data, "read") else io.BytesIO(data) as src:
-                while True:
-                    block = src.read(1024 * 1024)
-                    if not block:
-                        break
-                    spool.write(block)
-            spool.seek(0)
+        Retried uploads re-read the spool from position 0, so a transient
+        failure can never consume the source stream a second time.
+        """
+        spool = tempfile.SpooledTemporaryFile(
+            max_size=_SPOOL_LIMIT, mode="w+b")
+        with data if hasattr(data, "read") else io.BytesIO(data) as src:
+            while True:
+                block = src.read(1024 * 1024)
+                if not block:
+                    break
+                spool.write(block)
+        spool.seek(0)
+        return spool
 
-            headers = {
-                "Content-Type": "application/octet-stream",
-                "X-Goog-Upload-File-Name": "photo",
-                "X-Goog-Upload-Protocol": "raw",
-            }
-            resp = requests.post(UPLOAD_URL, data=spool, headers=headers,
-                                 timeout=300)
-            if resp.status_code != 200:
-                raise BackendError(
-                    f"upload to uploads endpoint: HTTP {resp.status_code}")
-            token = resp.text.strip()
-            if not token:
-                raise BackendError("upload returned an empty uploadToken")
-            return token
+    def upload_spool(self, spool) -> str:
+        """POST spooled bytes to the uploads endpoint, return uploadToken.
+
+        The spool is left OPEN so `_call` can re-run this on a transient
+        failure; `create_from_stream` closes it once.
+        """
+        spool.seek(0)
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "X-Goog-Upload-File-Name": "photo",
+            "X-Goog-Upload-Protocol": "raw",
+        }
+        resp = requests.post(UPLOAD_URL, data=spool, headers=headers,
+                             timeout=300)
+        if resp.status_code != 200:
+            raise BackendError(
+                f"upload to uploads endpoint: HTTP {resp.status_code}")
+        token = resp.text.strip()
+        if not token:
+            raise BackendError("upload returned an empty uploadToken")
+        return token
 
     def create_from_stream(self, stream: BinaryIO, file_name: str) -> str:
-        token = self._call(
-            lambda: self.upload_bytes(stream), "upload bytes"
-        )
+        spool = self._spool(stream)               # spool once ...
+        try:
+            token = self._call(                   # ... retry only the POST
+                lambda: self.upload_spool(spool), "upload bytes"
+            )
+        finally:
+            spool.close()
         body: dict = {
             "newMediaItems": [
                 {"simpleMediaItem": {"uploadToken": token, "fileName": file_name}}

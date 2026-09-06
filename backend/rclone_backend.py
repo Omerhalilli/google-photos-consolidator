@@ -26,7 +26,7 @@ import time
 from typing import BinaryIO, Iterator, Optional
 
 from backend.base import BackendError, BaseBackend, Capabilities, MediaItem
-from utils.hashing import sha256_stream
+from utils.hashing import sha256_stream_size
 
 _UNITS = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3,
           "T": 1024 ** 4, "P": 1024 ** 5}
@@ -133,7 +133,8 @@ class RcloneBackend(BaseBackend):
     def get_hash(self, item: MediaItem) -> str:
         proc = self._stream(["cat", f"{self._remote}:{item.media_id}"])
         try:
-            digest = sha256_stream(_ProcReader(proc))
+            digest, size = sha256_stream_size(_ProcReader(proc))
+            item.size = size
             proc.wait()
             if proc.returncode != 0:
                 raise BackendError(

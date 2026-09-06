@@ -21,13 +21,25 @@ def sha256_file(path: str) -> str:
 
 def sha256_stream(stream: BinaryIO) -> str:
     """Return the SHA-256 hex digest of a binary stream (streamed)."""
+    digest, _ = sha256_stream_size(stream)
+    return digest
+
+
+def sha256_stream_size(stream: BinaryIO) -> Tuple[str, int]:
+    """Return (SHA-256 hex digest, bytes read) of a binary stream.
+
+    Used while hashing so the item's real byte size is captured for free
+    (needed for the free-space pre-flight check).
+    """
     digest = hashlib.sha256()
+    size = 0
     while True:
         block = stream.read(CHUNK)
         if not block:
             break
         digest.update(block)
-    return digest.hexdigest()
+        size += len(block)
+    return digest.hexdigest(), size
 
 
 def hash_copy(
