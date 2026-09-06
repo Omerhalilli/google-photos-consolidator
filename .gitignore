@@ -1,0 +1,11 @@
+# Never commit secrets, tokens or photo data
+tokens/
+*.token
+oauth_client_secret*.json
+*.json
+*.log
+removal_manifest.jsonl
+__pycache__/
+*.pyc
+.venv/
+venv/

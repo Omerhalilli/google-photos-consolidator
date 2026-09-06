@@ -1,0 +1,64 @@
+# ============================================================
+# google_photos_consolidator configuration
+# ============================================================
+# backend: which implementation to use for ALL accounts.
+#   "oauth"  -> Google Photos Library API (native HTTP/API calls)
+#   "rclone" -> rclone command-line integration
+# You can also switch at runtime:  python main.py --backend rclone
+# or via env var GPC_BACKEND.
+backend: oauth
+
+# Ordered account list. The list index is used as the internal numeric
+# account id everywhere (logs, identifiers). Account emails, names and
+# paths are never logged by the program.
+accounts:
+  - id: 1
+    # rclone backend only: name of the "google photos" remote for this account
+    rclone_remote: gphotos1
+    # rclone backend only (optional but strongly recommended): a Google
+    # Drive remote used to query free storage, because Google Photos has
+    # no quota endpoint and `rclone about` is unsupported on photos remotes.
+    storage_rclone: gdrive1
+    # oauth backend only: token file name (stored inside the token dir)
+    oauth_token: account_1.json
+
+  - id: 2
+    rclone_remote: gphotos2
+    storage_rclone: gdrive2
+    oauth_token: account_2.json
+
+oauth:
+  # Environment variable that contains the *path* to the OAuth client
+  # secret JSON (never hard-code it here, never commit it).
+  client_secret_env: GPC_OAUTH_CLIENT_SECRET
+  # Environment variable with the directory where per-account token files
+  # are stored/loaded. If unset, defaults to <config-dir>/tokens.
+  token_dir_env: GPC_OAUTH_TOKEN_DIR
+  # Current (post 2025-03-31) Library API scopes. Google removed the old
+  # `photoslibrary` and `photoslibrary.readonly` scopes; the API only sees
+  # content created by this app.
+  photos_scopes:
+    - "https://www.googleapis.com/auth/photoslibrary.appendonly"
+    - "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata"
+    - "https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata"
+  # Scope used ONLY to read storage quota. Google Photos and Google Drive
+  # share one storage pool, so Drive's quota reflects the Photos usage.
+  storage_scope: "https://www.googleapis.com/auth/drive.readonly"
+
+consolidation:
+  # Filename prefix the tool prepends to every photo it uploads to the
+  # target account. Used for idempotency (re-runs detect existing copies).
+  marker_prefix: gpc_
+  # Number of parallel workers used while computing SHA-256 hashes.
+  concurrency: 4
+  # Retries on transient API/quota/5xx errors (exponential backoff).
+  retries: 5
+  # Backoff base in seconds: sleep = backoff_base ** attempt
+  backoff_base: 2.0
+  # File (0600, gitignored) that receives one JSON line per item the user
+  # must delete manually in the Photos web UI (Google exposes no API delete).
+  manifest_file: removal_manifest.jsonl
+
+logging:
+  log_file: gpc.log        # empty string disables file logging
+  log_level: INFO          # DEBUG | INFO | WARNING | ERROR
