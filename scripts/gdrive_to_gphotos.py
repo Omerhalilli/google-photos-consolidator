@@ -37,8 +37,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import requests
+import httplib2
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -141,9 +143,15 @@ def _save_token(creds: Credentials, token_path: str) -> None:
 # Drive access
 # ---------------------------------------------------------------------------
 class DriveClient:
-    def __init__(self, creds: Credentials) -> None:
-        self.service = build("drive", "v3", credentials=creds,
+    def __init__(self, creds: Credentials, read_timeout: int = 900) -> None:
+        # Build with a long read timeout so large videos don't abort mid-download.
+        http = AuthorizedHttp(
+            creds,
+            http=httplib2.Http(timeout=read_timeout),
+        )
+        self.service = build("drive", "v3", credentials=creds, http=http,
                              cache_discovery=False)
+        self._read_timeout = read_timeout
 
     def find_root_ids(self, names: List[str]) -> Dict[str, List[str]]:
         """Return {folder_name: [file_id,...]} for the top-level targets."""
@@ -211,18 +219,30 @@ class DriveClient:
         return files
 
     def download(self, file_id: str) -> Tuple[bytes, str, int]:
-        """Return (bytes, mime, size) of a file."""
+        """Return (bytes, mime, size) of a file, retrying on transient errors."""
         meta = self.service.files().get(
             fileId=file_id, fields="mimeType,size").execute()
         size = int(meta.get("size", 0))
         mime = meta.get("mimeType", "application/octet-stream")
-        request = self.service.files().get_media(fileId=file_id)
-        buf = _BytesBuffer()
-        dl = MediaIoBaseDownload(buf, request, chunksize=1024 * 1024)
-        done = False
-        while not done:
-            _, done = dl.next_chunk()
-        return buf.getvalue(), mime, size
+        last_exc: Optional[Exception] = None
+        for attempt in range(4):
+            try:
+                request = self.service.files().get_media(fileId=file_id)
+                buf = _BytesBuffer()
+                dl = MediaIoBaseDownload(buf, request, chunksize=4 * 1024 * 1024)
+                done = False
+                while not done:
+                    try:
+                        _, done = dl.next_chunk()
+                    except Exception:  # noqa: BLE001  (resume not supported; re-download)
+                        raise
+                return buf.getvalue(), mime, size
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt == 3:
+                    break
+                time.sleep(2 ** attempt)
+        raise RuntimeError(f"download failed after retries: {last_exc}")
 
 
 class _BytesBuffer:
