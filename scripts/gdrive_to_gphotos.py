@@ -287,15 +287,18 @@ class PhotosClient:
         return resp.json()
 
     def upload_bytes(self, data: bytes) -> str:
-        """Upload raw bytes, return the upload token (or raise)."""
+        """Upload raw bytes, return the upload token (or raise).
+
+        Uses a fresh requests session per call so concurrent workers are safe.
+        """
         headers = self._auth_headers()
         headers.update({
             "Content-Type": "application/octet-stream",
             "X-Goog-Upload-File-Name": "photo",
             "X-Goog-Upload-Protocol": "raw",
         })
-        resp = self._session.post(self.BASE + "/uploads", data=data,
-                                  headers=headers, timeout=600)
+        resp = requests.post(self.BASE + "/uploads", data=data,
+                             headers=headers, timeout=600)
         if resp.status_code != 200:
             raise RuntimeError(f"upload HTTP {resp.status_code}: "
                                f"{resp.text[:200]}")
@@ -396,6 +399,8 @@ def main() -> int:
                         help="directory for OAuth token + upload index (default .)")
     parser.add_argument("--limit", type=int, default=0,
                         help="upload at most N files (0 = unlimited)")
+    parser.add_argument("--jobs", type=int, default=4,
+                        help="parallel download/hash/upload workers (default 4)")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -443,34 +448,36 @@ def main() -> int:
         return 0
     log.info("Files to process after dedupe: %d", total)
 
-    # --- process: download -> content-hash check -> upload token -> batch ---
+    # --- process in parallel: download -> hash-check -> token -> batch ---
+    from concurrent.futures import ThreadPoolExecutor
+
     done = 0
     failed = 0
-    # pending holds (drive_id, name, data) already upload-tokenised
-    pending: List[Tuple[str, str, str, bytes]] = []
+    # seen_hashes: hashes known to be uploaded (index snapshot + this run),
+    # so concurrent workers skip same-content files already uploaded.
+    seen_hashes = {r.sha256 for r in index.by_drive_id.values()}
+    pending: List[Tuple[str, str, str, bytes, str]] = []  # (fid,name,token,data,sha)
 
     def flush_batch():
         nonlocal done, pending
         if not pending:
             return
         log.info("Creating %d media items in Photos (batch)...", len(pending))
-        created: Dict[str, str] = {}
         try:
             created = photos.batch_create(
-                [(tok, name) for _fid, name, tok, _data in pending])
-
+                [(tok, name) for _fid, name, tok, _data, _sha in pending])
         except Exception as exc:  # noqa: BLE001
             log.error("batchCreate failed for %d items: %s (will retry next run)",
                       len(pending), exc)
             pending = []
             return
         created_here = 0
-        for fid, name, _tok, data in pending:
+        for fid, name, _tok, data, sha in pending:
             pid = created.get(name)
             if pid:
                 rec = UploadRecord(
                     drive_id=fid, name=name, size=len(data),
-                    sha256=sha256_bytes(data), gphoto_id=pid,
+                    sha256=sha, gphoto_id=pid,
                     uploaded_at=time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 )
                 index.add(rec)
@@ -483,31 +490,37 @@ def main() -> int:
         log.info("Progress: %d/%d uploaded, %d failed",
                  done, total, failed)
 
-    BATCH = 10  # Photos batchCreate allows up to 50; 10 keeps each read small
-    for fid, name in candidates:
-        # download
+    def process_one(item):
+        fid, name = item
         try:
-            data, _mime, size = drive.download(fid)
+            data, _mime, _size = drive.download(fid)
         except Exception as exc:  # noqa: BLE001
             log.error("download failed %r: %s", name, exc)
-            failed += 1
-            continue
-        # content-hash dedupe (skips renamed files already uploaded here)
+            return None
         h = sha256_bytes(data)
-        if index.has_hash(h):
-            log.info("skip (identical content already uploaded via this tool): %s",
-                     name)
-            continue
-        # upload to Photos (raw bytes -> upload token)
+        if h in seen_hashes:
+            log.info("skip (identical content already uploaded): %s", name)
+            return None
         try:
             token = photos.upload_bytes(data)
         except Exception as exc:  # noqa: BLE001
             log.error("upload failed %r: %s", name, exc)
-            failed += 1
-            continue
-        pending.append((fid, name, token, data))
-        if len(pending) >= BATCH:
-            flush_batch()
+            return None
+        return (fid, name, token, data, h)
+
+    BATCH = 50  # Google's batchCreate limit
+    workers = max(1, min(args.jobs, 8))
+    log.info("Using %d parallel workers, batches of %d", workers, BATCH)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for result in pool.map(process_one, candidates):
+            if result is None:
+                failed += 1
+                continue
+            fid, name, token, data, h = result
+            seen_hashes.add(h)
+            pending.append(result)
+            if len(pending) >= BATCH:
+                flush_batch()
     flush_batch()
 
     log.info("ALL DONE. New uploads this run: %d  (failed: %d)",
